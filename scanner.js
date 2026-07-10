@@ -107,6 +107,17 @@ async function fetchQuote(symbol) {
       if (prevClose == null || prevClose === 0) continue;
 
       const changePct = ((price - prevClose) / prevClose) * 100;
+
+      // Sanity guard: a single-day move beyond this for an index/futures
+      // contract almost always means bad data (stale prevClose, wrong
+      // instrument, etc.) rather than a real move. Reject rather than
+      // silently feed a corrupted number into the score.
+      const SANITY_BOUND_PCT = 12;
+      if (Math.abs(changePct) > SANITY_BOUND_PCT) {
+        console.warn(`   ⚠️  ${symbol}: rejected suspicious ${changePct.toFixed(1)}% move (likely bad data)`);
+        continue;
+      }
+
       return {
         price,
         prevClose,
@@ -216,7 +227,84 @@ function sendTelegram(text) {
   });
 }
 
-// ─── Build & send the briefing ────────────────────────────────────────────────
+// ─── Persistent Track Record ──────────────────────────────────────────────────
+const fs = require("fs");
+const HISTORY_FILE = "./briefing_history.json";
+
+function loadHistory() {
+  try { return JSON.parse(fs.readFileSync(HISTORY_FILE, "utf8")); }
+  catch (e) { return []; }
+}
+
+function saveHistory(history) {
+  try { fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2)); }
+  catch (e) { console.error("Failed to save history:", e.message); }
+}
+
+function accuracyLine(history) {
+  const graded = history.filter(h => h.result && h.result !== "neutral-call");
+  if (graded.length === 0) return null;
+  const recent = graded.slice(-10);
+  const wins = recent.filter(h => h.result === "win").length;
+  const losses = recent.filter(h => h.result === "loss").length;
+  const pct = recent.length ? Math.round((wins / recent.length) * 100) : 0;
+  return `📋 Last ${recent.length} sessions: ${wins}W-${losses}L (${pct}% directional accuracy)`;
+}
+
+// Grades yesterday's (or any ungraded) call against how ES actually moved
+// from the time of that morning's briefing to now.
+async function gradeOpenCalls() {
+  const history = loadHistory();
+  const ungraded = history.filter(h => !h.graded);
+  if (ungraded.length === 0) return;
+
+  const current = await fetchQuote("ES=F");
+  if (!current) { console.warn("Grading skipped — couldn't fetch current ES price"); return; }
+
+  for (const entry of ungraded) {
+    // Only grade entries from a prior day (give the session time to play out)
+    const entryDate = new Date(entry.timestamp).toDateString();
+    if (entryDate === new Date().toDateString()) continue;
+
+    const esAtBriefing = entry.quotes?.["ES=F"]?.price;
+    if (!esAtBriefing) { entry.graded = true; entry.result = "no-data"; continue; }
+
+    const actualMovePct = ((current.price - esAtBriefing) / esAtBriefing) * 100;
+    const predictedUp = entry.score >= 2;
+    const predictedDown = entry.score <= -2;
+
+    let result;
+    if (!predictedUp && !predictedDown) {
+      result = "neutral-call"; // no directional call made, doesn't count for/against
+    } else if (predictedUp && actualMovePct > 0.05) {
+      result = "win";
+    } else if (predictedDown && actualMovePct < -0.05) {
+      result = "win";
+    } else if (Math.abs(actualMovePct) < 0.05) {
+      result = "neutral-call"; // market didn't really move, don't penalize
+    } else {
+      result = "loss";
+    }
+
+    entry.graded = true;
+    entry.result = result;
+    entry.actualMovePct = actualMovePct;
+
+    if (result === "win" || result === "loss") {
+      const emoji = result === "win" ? "✅" : "❌";
+      await sendTelegram(
+        `📋 *RECAP* — ${new Date(entry.timestamp).toLocaleDateString("en-US", { month: "short", day: "numeric" })}\n\n` +
+        `Called: *${entry.lean}* (score ${entry.score >= 0 ? "+" : ""}${entry.score})\n` +
+        `ES actually moved: ${actualMovePct >= 0 ? "+" : ""}${actualMovePct.toFixed(2)}%\n\n` +
+        `${emoji} ${result === "win" ? "Correct call" : "Missed call"}`
+      );
+    }
+  }
+
+  saveHistory(history);
+}
+
+
 function fmt(q, invertColor = false) {
   if (!q) return "  _(unavailable)_";
   const up = q.changePct >= 0;
@@ -248,6 +336,9 @@ async function runBriefing() {
 
   const { score, lean, emoji, signals } = scoreSentiment(quotes);
 
+  const history = loadHistory();
+  const accLine = accuracyLine(history);
+
   const dateStr = new Date().toLocaleDateString("en-US", {
     weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York",
   });
@@ -272,14 +363,24 @@ async function runBriefing() {
     `10Y: ${fmt(quotes["^TNX"], true)}\n\n` +
     `${emoji} *SENTIMENT: ${lean}*  _(score: ${score >= 0 ? "+" : ""}${score})_\n\n` +
     (signals.length ? `*Key signals:*\n${signals.map(s => `• ${s}`).join("\n")}\n\n` : "") +
+    (accLine ? `${accLine}\n\n` : "") +
     `_Informational aggregation of observable data — not financial advice or a prediction._`;
 
   await sendTelegram(msg);
   console.log(`   Sentiment: ${lean} (score ${score})`);
+
+  // Save this briefing for tomorrow's grading
+  history.push({
+    timestamp: new Date().toISOString(),
+    score, lean, quotes, graded: false,
+  });
+  saveHistory(history);
 }
 
 // ─── Scheduler — fire once per weekday at the target ET hour ──────────────────
 let lastSentDate = null;
+let lastGradedDate = null;
+const GRADING_HOUR_ET = 16; // 4:00 PM ET, after market close
 
 function checkSchedule() {
   const now = new Date();
@@ -287,12 +388,17 @@ function checkSchedule() {
   const day = et.getDay(); // 0=Sun, 6=Sat
   const dateKey = et.toDateString();
 
-  if (day === 0 || day === 6) return;                    // weekends off
-  if (et.getHours() !== CONFIG.briefingHourET) return;   // not the hour yet
-  if (lastSentDate === dateKey) return;                  // already sent today
+  if (day === 0 || day === 6) return; // weekends off
 
-  lastSentDate = dateKey;
-  runBriefing();
+  if (et.getHours() === CONFIG.briefingHourET && lastSentDate !== dateKey) {
+    lastSentDate = dateKey;
+    runBriefing();
+  }
+
+  if (et.getHours() === GRADING_HOUR_ET && lastGradedDate !== dateKey) {
+    lastGradedDate = dateKey;
+    gradeOpenCalls();
+  }
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────
