@@ -1,0 +1,13 @@
+{
+  "name": "ny-open-scanner",
+  "version": "1.0.0",
+  "description": "Pre-NY-open sentiment briefing for ES/NQ/YM via Telegram",
+  "main": "scanner.js",
+  "scripts": {
+    "start": "node scanner.js",
+    "test": "node scanner.js --now"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  }
+}
