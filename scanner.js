@@ -22,7 +22,12 @@ const CONFIG = {
     botToken: process.env.TELEGRAM_BOT_TOKEN,
     chatId: process.env.TELEGRAM_CHAT_ID,
   },
-  briefingHourET: parseInt(process.env.BRIEFING_HOUR || "8"), // 8 = 8:00 AM ET
+  briefingHourET: parseInt(process.env.BRIEFING_HOUR || "8"), // 8 = 8:00 AM ET — NY pre-open
+  // Asia's cash session opens ~9:00 AM JST, which is roughly 7-8 PM ET the
+  // prior evening depending on DST. Adjust if your alerts land at the wrong
+  // local time after a DST change.
+  asiaBriefingHourET: parseInt(process.env.ASIA_BRIEFING_HOUR || "19"), // 7 PM ET
+  enableAsiaBriefing: process.env.ENABLE_ASIA_BRIEFING !== "false", // on by default
 };
 
 // ─── Instruments ──────────────────────────────────────────────────────────────
@@ -46,6 +51,10 @@ const INSTRUMENTS = {
   macro: [
     { symbol: "DX-Y.NYB", name: "Dollar Index" },
     { symbol: "^TNX", name: "10Y Yield" },
+  ],
+  metals: [
+    { symbol: "GC=F", name: "Gold" },
+    { symbol: "SI=F", name: "Silver" },
   ],
 };
 
@@ -314,17 +323,89 @@ function fmt(q, invertColor = false) {
   return `${dot} ${arrow} ${q.changePct >= 0 ? "+" : ""}${q.changePct.toFixed(2)}%  (${q.price.toLocaleString("en-US", { maximumFractionDigits: 2 })})`;
 }
 
-async function runBriefing() {
-  console.log(`\n📡 Fetching pre-open data... ${new Date().toISOString()}`);
+// Gold's two biggest drivers are the dollar and real rates (proxied here by
+// the 10Y nominal yield). This flags when gold's move is CONSISTENT with
+// those drivers vs when it's diverging — divergence usually means safe-haven
+// flows are dominating (geopolitical stress, equity risk-off) rather than
+// the usual macro relationship.
+function goldCommentary(quotes) {
+  const gold = quotes["GC=F"];
+  const dxy = quotes["DX-Y.NYB"];
+  const tnx = quotes["^TNX"];
+  if (!gold) return null;
 
+  const lines = [`Gold: ${fmt(gold)}`];
+  if (quotes["SI=F"]) lines.push(`Silver: ${fmt(quotes["SI=F"])}`);
+
+  const notes = [];
+  if (dxy) {
+    const consistent = (gold.changePct > 0 && dxy.changePct < 0) || (gold.changePct < 0 && dxy.changePct > 0);
+    if (Math.abs(gold.changePct) > 0.2 && Math.abs(dxy.changePct) > 0.1) {
+      notes.push(consistent
+        ? "↔️ Moving inverse to DXY — normal relationship"
+        : "⚠️ Moving WITH the dollar — unusual, may signal safe-haven flow overriding the normal dollar relationship");
+    }
+  }
+  if (tnx && Math.abs(gold.changePct) > 0.3 && Math.abs(tnx.changePct) > 1) {
+    const consistent = (gold.changePct > 0 && tnx.changePct < 0) || (gold.changePct < 0 && tnx.changePct > 0);
+    notes.push(consistent
+      ? "↔️ Consistent with yield move"
+      : "⚠️ Diverging from yields — possible geopolitical/safe-haven bid");
+  }
+
+  return { text: lines.join("\n"), notes };
+}
+
+async function fetchAllQuotes() {
   const allSymbols = Object.values(INSTRUMENTS).flat();
   const quotes = {};
-  // Fetch sequentially with tiny gaps to be polite to the API
   for (const inst of allSymbols) {
     quotes[inst.symbol] = await fetchQuote(inst.symbol);
     await new Promise(r => setTimeout(r, 300));
   }
+  return quotes;
+}
 
+function buildBriefingMessage(quotes, { title, timeLabel, accLine }) {
+  const { score, lean, emoji, signals } = scoreSentiment(quotes);
+  const gold = goldCommentary(quotes);
+
+  const dateStr = new Date().toLocaleDateString("en-US", {
+    weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York",
+  });
+
+  const msg =
+    `${title} — ${dateStr}\n` +
+    `_${timeLabel} ET_\n\n` +
+    `*US Futures*\n` +
+    `ES:  ${fmt(quotes["ES=F"])}\n` +
+    `NQ: ${fmt(quotes["NQ=F"])}\n` +
+    `YM: ${fmt(quotes["YM=F"])}\n\n` +
+    `*Risk Gauge*\n` +
+    `VIX: ${fmt(quotes["^VIX"], true)}\n\n` +
+    `*Asia*\n` +
+    `Nikkei: ${fmt(quotes["^N225"])}\n` +
+    `Hang Seng: ${fmt(quotes["^HSI"])}\n\n` +
+    `*Europe*\n` +
+    `DAX: ${fmt(quotes["^GDAXI"])}\n` +
+    `FTSE: ${fmt(quotes["^FTSE"])}\n\n` +
+    `*Macro*\n` +
+    `DXY: ${fmt(quotes["DX-Y.NYB"], true)}\n` +
+    `10Y: ${fmt(quotes["^TNX"], true)}\n\n` +
+    (gold ? `*Precious Metals*\n${gold.text}\n${gold.notes.length ? gold.notes.map(n => `_${n}_`).join("\n") + "\n" : ""}\n` : "") +
+    `${emoji} *SENTIMENT: ${lean}*  _(score: ${score >= 0 ? "+" : ""}${score})_\n\n` +
+    (signals.length ? `*Key signals:*\n${signals.map(s => `• ${s}`).join("\n")}\n\n` : "") +
+    (accLine ? `${accLine}\n\n` : "") +
+    `_Informational aggregation of observable data — not financial advice or a prediction._`;
+
+  return { msg, score, lean };
+}
+
+async function runBriefing() {
+  console.log(`\n📡 Fetching pre-open data... ${new Date().toISOString()}`);
+
+  const quotes = await fetchAllQuotes();
+  const allSymbols = Object.values(INSTRUMENTS).flat();
   const fetched = Object.values(quotes).filter(Boolean).length;
   console.log(`   ${fetched}/${allSymbols.length} instruments fetched`);
 
@@ -334,37 +415,14 @@ async function runBriefing() {
     return;
   }
 
-  const { score, lean, emoji, signals } = scoreSentiment(quotes);
-
   const history = loadHistory();
   const accLine = accuracyLine(history);
+  const timeLabel = new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
 
-  const dateStr = new Date().toLocaleDateString("en-US", {
-    weekday: "long", month: "short", day: "numeric", timeZone: "America/New_York",
+  const { msg, score, lean } = buildBriefingMessage(quotes, {
+    title: "📊 *PRE-OPEN BRIEFING (NY)*",
+    timeLabel, accLine,
   });
-
-  const msg =
-    `📊 *PRE-OPEN BRIEFING — ${dateStr}*\n` +
-    `_${new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" })} ET_\n\n` +
-    `*Overnight Futures*\n` +
-    `ES:  ${fmt(quotes["ES=F"])}\n` +
-    `NQ: ${fmt(quotes["NQ=F"])}\n` +
-    `YM: ${fmt(quotes["YM=F"])}\n\n` +
-    `*Risk Gauge*\n` +
-    `VIX: ${fmt(quotes["^VIX"], true)}\n\n` +
-    `*Asia (closed)*\n` +
-    `Nikkei: ${fmt(quotes["^N225"])}\n` +
-    `Hang Seng: ${fmt(quotes["^HSI"])}\n\n` +
-    `*Europe (live)*\n` +
-    `DAX: ${fmt(quotes["^GDAXI"])}\n` +
-    `FTSE: ${fmt(quotes["^FTSE"])}\n\n` +
-    `*Macro*\n` +
-    `DXY: ${fmt(quotes["DX-Y.NYB"], true)}\n` +
-    `10Y: ${fmt(quotes["^TNX"], true)}\n\n` +
-    `${emoji} *SENTIMENT: ${lean}*  _(score: ${score >= 0 ? "+" : ""}${score})_\n\n` +
-    (signals.length ? `*Key signals:*\n${signals.map(s => `• ${s}`).join("\n")}\n\n` : "") +
-    (accLine ? `${accLine}\n\n` : "") +
-    `_Informational aggregation of observable data — not financial advice or a prediction._`;
 
   await sendTelegram(msg);
   console.log(`   Sentiment: ${lean} (score ${score})`);
@@ -377,9 +435,37 @@ async function runBriefing() {
   saveHistory(history);
 }
 
+// Asia-open framing: what happened in the just-finished US session that
+// Asian markets are about to react to, plus the same macro drivers. Same
+// data machinery as the NY briefing, different title/timing/framing.
+async function runAsiaBriefing() {
+  console.log(`\n📡 Fetching Asia-open data... ${new Date().toISOString()}`);
+
+  const quotes = await fetchAllQuotes();
+  const allSymbols = Object.values(INSTRUMENTS).flat();
+  const fetched = Object.values(quotes).filter(Boolean).length;
+  console.log(`   ${fetched}/${allSymbols.length} instruments fetched`);
+
+  if (fetched === 0) {
+    console.error("❌ No data fetched for Asia briefing.");
+    return;
+  }
+
+  const timeLabel = new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
+
+  const { msg, score, lean } = buildBriefingMessage(quotes, {
+    title: "🌏 *ASIA OPEN BRIEFING*",
+    timeLabel, accLine: null, // separate accuracy tracking not built for this session yet
+  });
+
+  await sendTelegram(msg);
+  console.log(`   Asia-open sentiment: ${lean} (score ${score})`);
+}
+
 // ─── Scheduler — fire once per weekday at the target ET hour ──────────────────
 let lastSentDate = null;
 let lastGradedDate = null;
+let lastAsiaSentDate = null;
 const GRADING_HOUR_ET = 16; // 4:00 PM ET, after market close
 
 function checkSchedule() {
@@ -395,6 +481,11 @@ function checkSchedule() {
     runBriefing();
   }
 
+  if (CONFIG.enableAsiaBriefing && et.getHours() === CONFIG.asiaBriefingHourET && lastAsiaSentDate !== dateKey) {
+    lastAsiaSentDate = dateKey;
+    runAsiaBriefing();
+  }
+
   if (et.getHours() === GRADING_HOUR_ET && lastGradedDate !== dateKey) {
     lastGradedDate = dateKey;
     gradeOpenCalls();
@@ -403,15 +494,17 @@ function checkSchedule() {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 console.log("══════════════════════════════════════════════");
-console.log("  Pre-NY-Open Sentiment Scanner — ES / NQ / YM");
-console.log(`  Briefing time: ${CONFIG.briefingHourET}:00 AM ET, weekdays`);
+console.log("  Global Session Sentiment Scanner — ES / NQ / YM + Gold");
+console.log(`  NY briefing:   ${CONFIG.briefingHourET}:00 ET, weekdays`);
+console.log(`  Asia briefing: ${CONFIG.enableAsiaBriefing ? `${CONFIG.asiaBriefingHourET}:00 ET, weekdays` : "disabled"}`);
 console.log("══════════════════════════════════════════════");
 
 if (process.argv.includes("--now")) {
-  // Manual test run: node scanner.js --now
   runBriefing();
+} else if (process.argv.includes("--now-asia")) {
+  runAsiaBriefing();
 } else {
-  console.log("⏰ Waiting for scheduled briefing time... (run with --now to test immediately)");
+  console.log("⏰ Waiting for scheduled briefing time... (--now or --now-asia to test immediately)");
   checkSchedule();
   setInterval(checkSchedule, 60 * 1000); // check every minute
 }
