@@ -84,8 +84,28 @@ async function fetchQuote(symbol) {
       if (!result) continue;
       const meta = result.meta;
       const price = meta.regularMarketPrice;
-      const prevClose = meta.chartPreviousClose ?? meta.previousClose;
-      if (price == null || prevClose == null) continue;
+      if (price == null) continue;
+
+      // meta.chartPreviousClose / meta.previousClose have proven unreliable
+      // (observed wrong-signed % changes vs verified real closes even when
+      // the price level itself was correct). Compute prevClose from the
+      // actual historical close-price series instead — far more trustworthy.
+      const closes = result.indicators?.quote?.[0]?.close || [];
+      const validCloses = closes.filter(c => c != null);
+
+      let prevClose = null;
+      if (validCloses.length >= 2) {
+        // Last entry may be today's still-forming candle (~= current price);
+        // the one before it is the last fully-closed session.
+        const last = validCloses[validCloses.length - 1];
+        const secondLast = validCloses[validCloses.length - 2];
+        prevClose = Math.abs(last - price) < Math.abs(secondLast - price) ? secondLast : last;
+      } else {
+        // Fallback only if the historical series wasn't usable
+        prevClose = meta.chartPreviousClose ?? meta.previousClose;
+      }
+      if (prevClose == null || prevClose === 0) continue;
+
       const changePct = ((price - prevClose) / prevClose) * 100;
       return {
         price,
